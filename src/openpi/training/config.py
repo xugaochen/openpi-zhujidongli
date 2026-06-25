@@ -463,6 +463,53 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotTronDataConfig(DataConfigFactory):
+    
+    use_delta_joint_actions: bool = True
+    default_prompt: str | None = None
+    adapt_to_pi: bool = True
+
+    # Repack transforms.
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {"cam_high": "observation.images.top"},
+                        "state": "observation.state",
+                        "actions": "action",
+                    }
+                )
+            ]
+        )
+    )
+    # Action keys that will be used to read the action sequence from the dataset.
+    action_sequence_keys: Sequence[str] = ("actions",)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[aloha_policy.AlohaInputs(adapt_to_pi=self.adapt_to_pi)],
+            outputs=[aloha_policy.AlohaOutputs(adapt_to_pi=self.adapt_to_pi)],
+        )
+        if self.use_delta_joint_actions:
+            delta_action_mask = _transforms.make_bool_mask(7, -1, 7, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+        )
+
+@dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
@@ -964,6 +1011,37 @@ _CONFIGS = [
         overwrite=True,
         exp_name="debug_pi05",
         wandb_enabled=False,
+    ),
+
+
+    #tron配置
+    TrainConfig(
+        name="pi0_tron",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotTronDataConfig(
+            repo_id="test_lerobot_v2.1",
+            default_prompt="banana",
+            use_delta_joint_actions=False,
+            adapt_to_pi=False,
+            action_sequence_keys=("action",),
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images":{
+                                "cam_high":"observation.images.cam_high",
+                                "cam_left_wrist":"observation.images.cam_left_wrist",
+                                "cam_right_wrist":"observation.images.cam_right_wrist",
+                            },
+                            "state":"observation.state",
+                            "actions":"action",
+                        }
+                    )
+                ]
+            )
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/workspace/openpi/checkpoint/openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=10_000,
     ),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
