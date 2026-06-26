@@ -7,10 +7,7 @@ from typing import Literal, Protocol, SupportsIndex, TypeVar
 
 import jax
 import jax.numpy as jnp
-try:  # Compatibility across LeRobot versions
-    import lerobot.datasets.lerobot_dataset as lerobot_dataset
-except ImportError:  # pragma: no cover - legacy path
-    import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
 import torch
 
@@ -130,256 +127,28 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
-class LeRobotOffsetDataset(torch.utils.data.Dataset):
-    """
-    A wrapper dataset that applies an offset to the 'task_index' field when accessing samples.
-    This avoids expensive preprocessing when loading multiple datasets.
-    """
-    def __init__(self, original_dataset, offset):
-        self._original_dataset = original_dataset
-        self._offset = offset
-
-    def __len__(self):
-        return len(self._original_dataset)
-
-    def __getitem__(self, index):
-        item = self._original_dataset[index]
-        # Only adjust if 'task_index' key exists
-        if "task_index" in item:
-            item["task_index"] += self._offset
-        return item
-
-
 def create_torch_dataset(
-    data_config: _config.DataConfig,
-    action_horizon: int,
-    model_config: _model.BaseModelConfig,
-    *,
-    validation: bool = False,
-    validation_ratio: float = 0.1,
+    data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
-    """Create a dataset for training with support for local data directories and validation split.
-    
-    Args:
-        data_config: The data configuration.
-        action_horizon: The action horizon.
-        model_config: The model configuration.
-        validation: If True, return the validation set, otherwise return the training set.
-        validation_ratio: The ratio of data to use for validation.
-    """
-    import os
-    import time
-    from concurrent.futures import ThreadPoolExecutor
-    import torch.utils.data
-    
+    """Create a dataset for training."""
     repo_id = data_config.repo_id
     if repo_id is None:
         raise ValueError("Repo ID is not set. Cannot create dataset.")
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
-    # Get local data directory and local_files_only settings
-    local_dir = getattr(data_config, "local_data_dir", None)
-    local_files_only = getattr(data_config, "local_files_only", False)
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    dataset = lerobot_dataset.LeRobotDataset(
+        data_config.repo_id,
+        delta_timestamps={
+            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
+        },
+    )
 
-    if local_files_only and not local_dir:
-        raise ValueError("When local_files_only is True, local_data_dir must be provided")
-    
-    # Support multiple directories (comma-separated)
-    if local_dir and "," in local_dir:
-        local_dirs = [d.strip() for d in local_dir.split(",") if d.strip()]
-        for d in local_dirs:
-            if not os.path.exists(d):
-                raise FileNotFoundError(f"Local dataset path does not exist: {d}")
-        
-        # Use directory basename as repo_id for each dataset
-        repo_ids = [os.path.basename(os.path.normpath(d)) for d in local_dirs]
-        print(f"Creating multi-dataset: repo_ids={repo_ids}")
+    if data_config.prompt_from_task:
+        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
 
-        start_time = time.time()
-        
-        def load_single_dataset(local_dir, repo_id):
-            """Load a single dataset"""
-            print(f"Loading dataset: {repo_id} (directory: {local_dir})")
-            ds_start = time.time()
-            try:
-                ds = lerobot_dataset.LeRobotDataset(
-                    repo_id=repo_id,
-                    root=local_dir,
-                    delta_timestamps={
-                        key: [t / 10 for t in range(action_horizon)]
-                        for key in data_config.action_sequence_keys
-                    }
-                )
-                print(f"Dataset {repo_id} loaded, size: {len(ds)}, time: {time.time() - ds_start:.2f}s")
-                return ds
-            except Exception as e:
-                print(f"Failed to load dataset {repo_id}: {str(e)}")
-                return None
-
-        # Parallel loading
-        with ThreadPoolExecutor(max_workers=min(len(local_dirs), 4)) as executor:
-            futures = [
-                executor.submit(load_single_dataset, local_dir, repo_id)
-                for local_dir, repo_id in zip(local_dirs, repo_ids)
-            ]
-            
-            datasets = []
-            for future in futures:
-                try:
-                    ds = future.result()
-                    if ds is not None:
-                        datasets.append(ds)
-                except Exception as e:
-                    print(f"Error processing dataset result: {str(e)}")
-            
-        if not datasets:
-            raise ValueError("All datasets failed to load")
-            
-        print(f"All datasets loaded, total time: {time.time() - start_time:.2f}s")
-        
-        # Concatenate datasets
-        dataset = torch.utils.data.ConcatDataset(datasets)
-
-        # Support prompt_from_task
-        if data_config.prompt_from_task:
-            task_start = time.time()
-            all_tasks = {}
-            task_offset = 0
-            print("Processing task information...")
-            for i, ds in enumerate(datasets):
-                if hasattr(ds, "meta") and hasattr(ds.meta, "tasks"):
-                    n_tasks = len(ds.meta.tasks)
-                    print(f"Processing tasks for dataset {repo_ids[i]} ({n_tasks} tasks)...")
-                    # Apply task offset lazily
-                    datasets[i] = LeRobotOffsetDataset(ds, task_offset)
-                    all_tasks.update({(k + task_offset): v for k, v in ds.meta.tasks.items()})
-                    task_offset += n_tasks
-                    print(f"Dataset {repo_ids[i]} task processing completed")
-                else:
-                    print(f"Dataset {repo_ids[i]} has no task information, skipping.")
-            
-            # Recreate concat dataset after wrapping with LeRobotOffsetDataset
-            dataset = torch.utils.data.ConcatDataset(datasets)
-            
-            if all_tasks:
-                print(f"Total merged tasks: {len(all_tasks)}")
-                print(f"Tasks: {list(all_tasks.items())}")
-                dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(all_tasks)])
-            else:
-                print("Warning: No task information found")
-            print(f"Task processing completed, time: {time.time() - task_start:.2f}s")
-        
-        # Apply validation split if needed
-        if validation_ratio > 0:
-            total_size = len(dataset)
-            validation_size = int(total_size * validation_ratio)
-            training_size = total_size - validation_size
-            
-            indices = list(range(total_size))
-            generator = torch.Generator()
-            generator.manual_seed(0)  # Fixed seed for consistent splits
-            indices = torch.randperm(total_size, generator=generator).tolist()
-            
-            train_indices = indices[:training_size]
-            val_indices = indices[training_size:]
-            
-            if validation:
-                dataset = torch.utils.data.Subset(dataset, val_indices)
-                print(f"Using validation set, size: {len(dataset)}")
-            else:
-                dataset = torch.utils.data.Subset(dataset, train_indices)
-                print(f"Using training set, size: {len(dataset)}")
-        
-
-        # print("============================================")
-        # print("Dataset length:", len(dataset))
-        # for i in [0,496]:
-        #     print(f"iiiii{i}")
-        #     sample = dataset[i]
-        #     print("Sample keys:", sample.keys())
-        #     for k, v in sample.items():
-        #         print(f"{k}: shape={getattr(v, 'shape', None)}, type={type(v)}")
-        #         if k == "actions":
-        #             print(k,v)
-        #         if k == "actions_is_pad":
-        #             print(k,v)
-        # print("===========================================")
-        return dataset
-
-    # Single directory logic
-    if local_dir and not os.path.exists(local_dir):
-        raise FileNotFoundError(f"Local dataset path does not exist: {local_dir}")
-
-    print(f"Creating dataset: repo_id={repo_id}, local_files_only={local_files_only}, local_dir={local_dir}")
-
-    try:
-        # Load dataset metadata
-        try:
-            dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(
-                repo_id=repo_id,
-                root=local_dir
-            )
-            print(f"Successfully loaded dataset metadata")
-        except Exception as e:
-            print(f"Warning: Failed to load dataset metadata: {e}. Using default FPS=10 and empty task list.")
-            # Use default values if metadata loading fails
-            class FallbackMeta:
-                def __init__(self):
-                    self.fps = 10
-                    self.tasks = {}
-            dataset_meta = FallbackMeta()
-    
-        # Create dataset instance
-        dataset = lerobot_dataset.LeRobotDataset(
-            repo_id=repo_id,
-            delta_timestamps={
-                key: [t / dataset_meta.fps for t in range(action_horizon)]
-                for key in data_config.action_sequence_keys
-            },
-            root=local_dir
-        )
-
-        if data_config.prompt_from_task:
-            dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
-        
-        # Apply validation split if needed
-        if validation_ratio > 0:
-            total_size = len(dataset)
-            validation_size = int(total_size * validation_ratio)
-            training_size = total_size - validation_size
-            
-            indices = list(range(total_size))
-            generator = torch.Generator()
-            generator.manual_seed(0)  # Fixed seed for consistent splits
-            indices = torch.randperm(total_size, generator=generator).tolist()
-            
-            train_indices = indices[:training_size]
-            val_indices = indices[training_size:]
-            
-            if validation:
-                dataset = torch.utils.data.Subset(dataset, val_indices)
-                print(f"Using validation set, size: {len(dataset)}")
-            else:
-                dataset = torch.utils.data.Subset(dataset, train_indices)
-                print(f"Using training set, size: {len(dataset)}")
-        
-        # print("============================================")
-        # print("Dataset length:", len(dataset))
-        # for i in [0,496,497,499]:
-        #     print(f"iiiii{i}")
-        #     sample = dataset[i]
-        #     print("Sample keys:", sample.keys())
-        #     for k, v in sample.items():
-        #         print(f"{k}: shape={getattr(v, 'shape', None)}, type={type(v)}")
-        #         if k == "actions_is_pad":
-        #             print(k,v)
-        # print("===========================================")
-
-        return dataset
-    except Exception as e:
-        print(f"Error creating dataset: {e}")
-        raise
+    return dataset
 
 
 def create_rlds_dataset(
@@ -396,7 +165,7 @@ def create_rlds_dataset(
         shuffle=shuffle,
         action_chunk_size=action_horizon,
         action_space=data_config.action_space,
-        filter_dict_path=data_config.filter_dict_path,
+        datasets=data_config.datasets,
     )
 
 
@@ -459,7 +228,6 @@ def create_data_loader(
     num_batches: int | None = None,
     skip_norm_stats: bool = False,
     framework: Literal["jax", "pytorch"] = "jax",
-    validation: bool = False,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -470,13 +238,9 @@ def create_data_loader(
         num_batches: Determines the number of batches to return.
         skip_norm_stats: Whether to skip data normalization.
         framework: The framework to use ("jax" or "pytorch").
-        validation: If True, return the validation set, otherwise return the training set.
     """
     data_config = config.data.create(config.assets_dirs, config.model)
     logging.info(f"data_config: {data_config}")
-    
-    # Get validation_ratio from config if available
-    validation_ratio = getattr(config, "validation_data_ratio", 0.1)
 
     if data_config.rlds_data_dir is not None:
         return create_rlds_data_loader(
@@ -501,8 +265,6 @@ def create_data_loader(
         seed=config.seed,
         skip_norm_stats=skip_norm_stats,
         framework=framework,
-        validation=validation,
-        validation_ratio=validation_ratio,
     )
 
 
@@ -519,8 +281,6 @@ def create_torch_data_loader(
     num_workers: int = 0,
     seed: int = 0,
     framework: str = "jax",
-    validation: bool = False,
-    validation_ratio: float = 0.1,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -538,12 +298,8 @@ def create_torch_data_loader(
         num_workers: The number of worker processes to use. If zero, the data loader will
             execute in the main process.
         seed: The seed to use for shuffling the data.
-        validation: If True, return the validation set, otherwise return the training set.
-        validation_ratio: The ratio of data to use for validation.
     """
-    dataset = create_torch_dataset(
-        data_config, action_horizon, model_config, validation=validation, validation_ratio=validation_ratio
-    )
+    dataset = create_torch_dataset(data_config, action_horizon, model_config)
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
     # Use TorchDataLoader for both frameworks
