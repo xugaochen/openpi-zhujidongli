@@ -1024,7 +1024,7 @@ _CONFIGS = [
     #tron配置
     TrainConfig(
         name="pi0_tron",
-        model=pi0_config.Pi0Config(pi05=True),
+        model=pi0_config.Pi0Config(pi05=True,action_horizon=50),
         data=LeRobotTronDataConfig(
             repo_id="test_lerobot_v2.1",
             default_prompt="banana",

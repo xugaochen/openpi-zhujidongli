@@ -16,7 +16,7 @@
         "channel"
       ]
     },
-    "observation.images.cam_right_wrist": {
+    "observation.images.cam_left_wrist": {
       "dtype": "image",
       "shape": [
         480,
@@ -29,7 +29,7 @@
         "channel"
       ]
     },
-    "observation.images.cam_left_wrist": {
+    "observation.images.cam_right_wrist": {
       "dtype": "image",
       "shape": [
         480,
@@ -124,7 +124,7 @@
         "qw"
       ]
     },
-    "observation.ee_pose_cmd_right": {
+    "observation.ee_pose_cmd_left": {
       "dtype": "float32",
       "shape": [
         7
@@ -139,7 +139,7 @@
         "qw"
       ]
     },
-    "observation.ee_pose_cmd_left": {
+    "observation.ee_pose_cmd_right": {
       "dtype": "float32",
       "shape": [
         7
@@ -190,8 +190,8 @@
       "names": null
     }
   },
-  "total_episodes": 56,
-  "total_frames": 17539,
+  "total_episodes": 1,
+  "total_frames": 818,
   "total_tasks": 1,
   "total_chunks": 1,
   "total_videos": 0,
@@ -199,6 +199,6 @@
   "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
   "video_path": "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
   "splits": {
-    "train": "0:56"
+    "train": "0:1"
   }
 }
